@@ -1,0 +1,40 @@
+cabal-version:      3.0
+name:               giterator
+version:            0.1.0.0
+synopsis:           Inspect and rewrite git history
+license:            NONE
+author:             Aaron Godwood
+maintainer:         azmclaz@gmail.com
+build-type:         Simple
+extra-doc-files:    plan.md
+
+common shared
+    default-language: GHC2021
+    default-extensions: OverloadedStrings
+    ghc-options:      -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    build-depends:    base >=4.17 && <5
+                    , bytestring >=0.11 && <0.13
+
+library
+    import:           shared
+    hs-source-dirs:   src
+    exposed-modules:  Git.Types
+
+executable giterator
+    import:           shared
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    giterator
+
+test-suite giterator-test
+    import:           shared
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    other-modules:    Fixture
+    build-depends:    giterator
+                    , hspec >=2.10 && <3
+                    , typed-process >=0.2.11 && <0.3
+                    , directory >=1.3 && <1.4
+                    , filepath >=1.4 && <1.6
+                    , temporary >=1.3 && <1.4
