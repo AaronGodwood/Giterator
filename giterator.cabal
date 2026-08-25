@@ -10,7 +10,7 @@ extra-doc-files:    plan.md
 
 common shared
     default-language: GHC2021
-    default-extensions: OverloadedStrings
+    default-extensions: OverloadedStrings, LambdaCase
     ghc-options:      -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
     build-depends:    base >=4.17 && <5
                     , bytestring >=0.11 && <0.13
@@ -19,12 +19,20 @@ library
     import:           shared
     hs-source-dirs:   src
     exposed-modules:  Git.Types
+                      Git.Object
+                      Git.Store
+                      Git.Date
+    build-depends:    base16-bytestring >=1.0 && <1.1
+                    , cryptohash-sha1 >=0.11 && <0.12
+                    , time >=1.12 && <1.15
+                    , typed-process >=0.2.11 && <0.3
 
 executable giterator
     import:           shared
     hs-source-dirs:   app
     main-is:          Main.hs
     build-depends:    giterator
+                    , optparse-applicative >=0.17 && <0.19
 
 test-suite giterator-test
     import:           shared
@@ -32,8 +40,12 @@ test-suite giterator-test
     hs-source-dirs:   test
     main-is:          Spec.hs
     other-modules:    Fixture
+                      Gen
+                      ObjectSpec
+                      StoreSpec
     build-depends:    giterator
                     , hspec >=2.10 && <3
+                    , QuickCheck >=2.14 && <2.16
                     , typed-process >=0.2.11 && <0.3
                     , directory >=1.3 && <1.4
                     , filepath >=1.4 && <1.6
