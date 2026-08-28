@@ -1,12 +1,14 @@
 module Main (main) where
 
-import Control.Monad (foldM, forM_, unless)
+import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.Maybe (fromMaybe)
 import Git.Date (formatSignatureDate)
 import Git.Object
+import Git.Refs
+import Git.Rewrite
 import Git.Store
 import Git.Types
 import Numeric (showHex)
@@ -18,6 +20,8 @@ data Command
   = Log (Maybe String) (Maybe Int)
   | Show String Bool
   | Verify (Maybe String)
+  | Rewrite [String] Bool
+  | Undo
 
 data Options = Options
   { optRepo    :: FilePath
@@ -33,6 +37,8 @@ main = do
     Log rev limit -> runLog store rev limit
     Show rev raw  -> runShow store rev raw
     Verify rev    -> runVerify store rev
+    Rewrite branches dryRun -> runRewrite store branches dryRun
+    Undo          -> runUndo store
 
 cli :: ParserInfo Options
 cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git history")
@@ -40,7 +46,7 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     options =
       Options
         <$> strOption (short 'C' <> metavar "PATH" <> value "." <> showDefault <> help "Repository to operate on")
-        <*> hsubparser (logCmd <> showCmd <> verifyCmd)
+        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> undoCmd)
     logCmd =
       command "log" . info (Log <$> optional revArg <*> optional limitOpt) $
         progDesc "List commits, showing committer date too when it differs from the author's"
@@ -50,6 +56,13 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     verifyCmd =
       command "verify" . info (Verify <$> optional revArg) $
         progDesc "Check every commit and tree round-trips byte-exactly (default: all refs)"
+    rewriteCmd =
+      command "rewrite" . info (Rewrite <$> many (strArgument (metavar "BRANCH...")) <*> dryRunOpt) $
+        progDesc "Rewrite history of the given branches (default: all). No transforms yet: this is the identity"
+    undoCmd =
+      command "undo" . info (pure Undo) $
+        progDesc "Restore the branches and tags from before the most recent rewrite"
+    dryRunOpt = switch (long "dry-run" <> help "Show what would change without moving any refs")
     revArg = strArgument (metavar "REV")
     limitOpt = option auto (short 'n' <> metavar "N" <> help "Show at most N commits")
 
@@ -145,6 +158,34 @@ escape = BS.concatMap $ \w -> case w of
     | otherwise -> "\\x" <> BC.pack (pad (showHex w ""))
   where
     pad s = replicate (2 - length s) '0' <> s
+
+-- rewrite / undo -------------------------------------------------------------
+
+runRewrite :: Store -> [String] -> Bool -> IO ()
+runRewrite store branches dryRun = do
+  r <- rewriteBranches store dryRun mempty (map BC.pack branches)
+  BC.putStrLn $
+    "rewrote " <> BC.pack (show (rpCommits r)) <> " commits, "
+      <> BC.pack (show (length (rpChanged r))) <> " changed"
+  when dryRun $ forM_ (rpChanged r) $ \(old, new) -> do
+    c <- readCommit store old
+    BC.putStrLn ("  " <> shortHex old <> " -> " <> shortHex new <> "  " <> BC.takeWhile (/= '\n') (cMessage c))
+  forM_ (rpUpdates r) $ \u ->
+    BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
+  forM_ (rpSkippedTags r) $ \t ->
+    BC.putStrLn ("warning: annotated tag " <> refName t <> " still points at the old history")
+  BC.putStrLn $ case rpBackup r of
+    _ | dryRun -> "dry run: no refs were changed"
+    Nothing -> "nothing changed"
+    Just n -> "backup saved as #" <> BC.pack (show n) <> "; run `giterator undo` to restore"
+
+runUndo :: Store -> IO ()
+runUndo store = undoLatest store >>= \case
+  Nothing -> BC.putStrLn "no rewrites to undo"
+  Just (n, restores) -> do
+    forM_ restores $ \u ->
+      BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
+    BC.putStrLn ("restored backup #" <> BC.pack (show n))
 
 -- verify ---------------------------------------------------------------------
 

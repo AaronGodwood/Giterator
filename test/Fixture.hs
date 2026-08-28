@@ -2,6 +2,8 @@
 module Fixture
   ( FixtureCommit (..)
   , withFixtureRepo
+  , fixtureCommit
+  , fixtureGit
   , git
   ) where
 
@@ -29,19 +31,22 @@ withFixtureRepo commits action =
     let repo = root </> "repo"
     createDirectoryIfMissing True repo
     BS.writeFile (root </> "empty-gitconfig") BS.empty
-    let run = gitWith (isolatedEnv root) repo
-    _ <- run Nothing ["init", "-q", "-b", "main"]
-    _ <- run Nothing ["config", "core.autocrlf", "false"]
-    mapM_ (commitOne run repo) commits
+    _ <- fixtureGit repo Nothing ["init", "-q", "-b", "main"]
+    _ <- fixtureGit repo Nothing ["config", "core.autocrlf", "false"]
+    mapM_ (fixtureCommit repo) commits
     action repo
   where
     acquire = getTemporaryDirectory >>= (`createTempDirectory` "giterator")
 
-commitOne :: (Maybe Integer -> [String] -> IO ByteString) -> FilePath -> FixtureCommit -> IO ()
-commitOne run repo c = do
+-- | Run git with the fixture's isolated config, optionally pinning both dates.
+fixtureGit :: FilePath -> Maybe Integer -> [String] -> IO ByteString
+fixtureGit repo = gitWith (isolatedEnv (takeDirectory repo)) repo
+
+fixtureCommit :: FilePath -> FixtureCommit -> IO ()
+fixtureCommit repo c = do
   mapM_ writeFixtureFile (fcFiles c)
-  _ <- run Nothing ["add", "-A"]
-  _ <- run (Just (fcTime c)) ["commit", "-q", "--allow-empty", "-m", fcMessage c]
+  _ <- fixtureGit repo Nothing ["add", "-A"]
+  _ <- fixtureGit repo (Just (fcTime c)) ["commit", "-q", "--allow-empty", "-m", fcMessage c]
   pure ()
   where
     writeFixtureFile (path, contents) = do
