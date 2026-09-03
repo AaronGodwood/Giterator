@@ -11,6 +11,7 @@ import Git.Refs
 import Git.Rewrite
 import Git.Store
 import Git.Types
+import Transform.Time
 import Numeric (showHex)
 import Options.Applicative
 import System.Exit (die, exitFailure)
@@ -20,7 +21,7 @@ data Command
   = Log (Maybe String) (Maybe Int)
   | Show String Bool
   | Verify (Maybe String)
-  | Rewrite [String] Bool
+  | Rewrite [String] Bool TimeOptions
   | Undo
 
 data Options = Options
@@ -37,7 +38,7 @@ main = do
     Log rev limit -> runLog store rev limit
     Show rev raw  -> runShow store rev raw
     Verify rev    -> runVerify store rev
-    Rewrite branches dryRun -> runRewrite store branches dryRun
+    Rewrite branches dryRun timeOpts -> runRewrite store branches dryRun timeOpts
     Undo          -> runUndo store
 
 cli :: ParserInfo Options
@@ -57,8 +58,24 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
       command "verify" . info (Verify <$> optional revArg) $
         progDesc "Check every commit and tree round-trips byte-exactly (default: all refs)"
     rewriteCmd =
-      command "rewrite" . info (Rewrite <$> many (strArgument (metavar "BRANCH...")) <*> dryRunOpt) $
-        progDesc "Rewrite history of the given branches (default: all). No transforms yet: this is the identity"
+      command "rewrite" . info (Rewrite <$> many (strArgument (metavar "BRANCH...")) <*> dryRunOpt <*> timeOpts) $
+        progDesc "Rewrite history of the given branches (default: all). Date options apply in the order: spread, shift, jitter, work-hours, tz"
+    timeOpts =
+      TimeOptions
+        <$> option (eitherReader parseWhich) (long "dates" <> metavar "author|committer|both" <> value Both <> help "Which dates to change (default: both)")
+        <*> optional (option (eitherReader parseRange) (long "spread" <> metavar "FROM..TO" <> help "Stretch or squash history linearly into this range, UTC (e.g. 2024-01-01..2024-03-01)"))
+        <*> optional (option (eitherReader parseDuration) (long "shift" <> metavar "DURATION" <> help "Move every date by DURATION (e.g. 3d, -2h30m)"))
+        <*> optional (option (eitherReader parseDuration) (long "jitter" <> metavar "DURATION" <> help "Move each commit by a reproducible random offset of up to ±DURATION"))
+        <*> (BC.pack <$> strOption (long "seed" <> metavar "TEXT" <> value "giterator" <> help "Seed for --jitter"))
+        <*> optional (option (eitherReader parseWindow) (long "work-hours" <> metavar "HH:MM-HH:MM" <> help "Squeeze each day's commits into these local hours"))
+        <*> ((\tz mode -> (,mode) <$> tz)
+              <$> optional (option (eitherReader parseTz) (long "tz" <> metavar "+HHMM" <> help "Set the timezone (keeps the instant, so the local clock time changes)"))
+              <*> flag KeepInstant KeepWallClock (long "keep-wall-clock" <> help "With --tz: keep the local clock time and move the instant instead"))
+    parseWhich = \case
+      "author" -> Right Author
+      "committer" -> Right Committer
+      "both" -> Right Both
+      s -> Left ("expected author, committer or both, not " <> show s)
     undoCmd =
       command "undo" . info (pure Undo) $
         progDesc "Restore the branches and tags from before the most recent rewrite"
@@ -161,15 +178,23 @@ escape = BS.concatMap $ \w -> case w of
 
 -- rewrite / undo -------------------------------------------------------------
 
-runRewrite :: Store -> [String] -> Bool -> IO ()
-runRewrite store branches dryRun = do
-  r <- rewriteBranches store dryRun mempty (map BC.pack branches)
+runRewrite :: Store -> [String] -> Bool -> TimeOptions -> IO ()
+runRewrite store branches dryRun timeOpts = do
+  r <- rewriteBranches store dryRun (timePlan timeOpts) (map BC.pack branches)
   BC.putStrLn $
     "rewrote " <> BC.pack (show (rpCommits r)) <> " commits, "
       <> BC.pack (show (length (rpChanged r))) <> " changed"
   when dryRun $ forM_ (rpChanged r) $ \(old, new) -> do
-    c <- readCommit store old
-    BC.putStrLn ("  " <> shortHex old <> " -> " <> shortHex new <> "  " <> BC.takeWhile (/= '\n') (cMessage c))
+    before <- readCommit store old
+    after <- readCommit store new
+    let dates
+          | cAuthor before == cAuthor after = ""
+          | otherwise = formatSignatureDate (cAuthor before) <> " -> " <> formatSignatureDate (cAuthor after) <> "  "
+    BC.putStrLn ("  " <> shortHex old <> " -> " <> shortHex new <> "  " <> dates <> BC.takeWhile (/= '\n') (cMessage before))
+  unless (null (rpOutOfOrder r)) $
+    BC.putStrLn $
+      "warning: " <> BC.pack (show (length (rpOutOfOrder r)))
+        <> " commit(s) now have a committer date before their parent's; date-sorted views such as GitHub will show them out of order"
   forM_ (rpUpdates r) $ \u ->
     BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
   forM_ (rpSkippedTags r) $ \t ->

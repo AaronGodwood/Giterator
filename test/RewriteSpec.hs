@@ -9,6 +9,7 @@ import Git.Rewrite
 import Git.Store
 import Git.Types
 import Test.Hspec
+import Transform.Time (TimeOptions (..), Which (..), defaultTimeOptions, timePlan)
 
 -- main: first - second - third - merge
 --                    \           /
@@ -34,7 +35,13 @@ prefixMessages :: Transform
 prefixMessages = pureTransform (\c -> c {cMessage = "x: " <> cMessage c})
 
 rewrite :: FilePath -> Bool -> Transform -> [ByteString] -> IO Report
-rewrite repo dryRun t branches = withStore repo (\s -> rewriteBranches s dryRun t branches)
+rewrite repo dryRun t = rewriteWith repo dryRun (const t)
+
+rewriteWith :: FilePath -> Bool -> Plan -> [ByteString] -> IO Report
+rewriteWith repo dryRun plan branches = withStore repo (\s -> rewriteBranches s dryRun plan branches)
+
+dates :: FilePath -> String -> IO [[Int]]
+dates repo rev = map (map (read . BC.unpack) . BC.words) . BC.lines <$> git repo ["log", "--format=%at %ct", rev]
 
 refsOf :: FilePath -> IO ByteString
 refsOf repo = git repo ["for-each-ref", "--format=%(objectname) %(refname)"]
@@ -46,12 +53,12 @@ spec :: Spec
 spec = do
   describe "identity rewrite" $
     it "reproduces every hash and touches no refs" $ withHistory $ \repo -> do
-      before <- refsOf repo
+      original <- refsOf repo
       r <- rewrite repo False mempty []
       rpCommits r `shouldBe` 5
       rpChanged r `shouldBe` []
       rpBackup r `shouldBe` Nothing
-      refsOf repo `shouldReturn` before
+      refsOf repo `shouldReturn` original
 
   describe "rewriting messages" $ do
     it "rewrites every commit, including through the merge" $ withHistory $ \repo -> do
@@ -77,11 +84,11 @@ spec = do
       git repo ["rev-parse", "main"] `shouldReturn` mainBefore
 
     it "leaves refs alone on a dry run" $ withHistory $ \repo -> do
-      before <- refsOf repo
+      original <- refsOf repo
       r <- rewrite repo True prefixMessages []
       length (rpChanged r) `shouldBe` 5
       rpBackup r `shouldBe` Nothing
-      refsOf repo `shouldReturn` before
+      refsOf repo `shouldReturn` original
 
     it "refuses to run with uncommitted changes" $ withHistory $ \repo -> do
       BS.writeFile (repo <> "/README.md") "edited\n"
@@ -89,12 +96,12 @@ spec = do
 
   describe "undo" $ do
     it "restores every ref and removes the backup" $ withHistory $ \repo -> do
-      before <- refsOf repo
+      original <- refsOf repo
       _ <- rewrite repo False prefixMessages []
       _ <- rewrite repo False prefixMessages []
       Just (2, _) <- withStore repo undoLatest
       Just (1, _) <- withStore repo undoLatest
-      refsOf repo `shouldReturn` before
+      refsOf repo `shouldReturn` original
       withStore repo undoLatest >>= (`shouldSatisfy` null)
       git repo ["status", "--porcelain"] `shouldReturn` ""
 
@@ -105,9 +112,30 @@ spec = do
       withStore repo undoLatest `shouldThrow` anyException
       git repo ["rev-parse", "main"] `shouldReturn` tip
 
+  describe "rewriting dates" $ do
+    it "shifts author and committer dates" $ withHistory $ \repo -> do
+      original <- dates repo "main"
+      _ <- rewriteWith repo False (timePlan defaultTimeOptions {toShift = Just 86400}) []
+      dates repo "main" `shouldReturn` map (map (+ 86400)) original
+
+    it "spreads history across a range, keeping the ends" $ withHistory $ \repo -> do
+      let (from, to) = (1704067200, 1709251200)
+      _ <- rewriteWith repo False (timePlan defaultTimeOptions {toSpread = Just (from, to), toWhich = Author}) []
+      authored <- map head <$> dates repo "main"
+      maximum authored `shouldBe` fromIntegral to
+      minimum authored `shouldBe` fromIntegral from
+
+    it "warns about commits newly dated before their parent" $ withHistory $ \repo -> do
+      let backdateThird = pureTransform $ \c ->
+            if cMessage c == "third\n" then c {cCommitter = (cCommitter c) {sigTime = 0}} else c
+      r <- rewrite repo False backdateThird []
+      length (rpOutOfOrder r) `shouldBe` 1
+      r' <- rewrite repo False prefixMessages []
+      rpOutOfOrder r' `shouldBe` []
+
   describe "written objects" $
     it "are readable by the same store that wrote them" $ withHistory $ \repo -> withStore repo $ \s -> do
-      _ <- rewriteBranches s False prefixMessages []
+      _ <- rewriteBranches s False (const prefixMessages) []
       Just (oid, ObjCommit, _) <- lookupObject s "main"
       c <- readCommit s oid
       cMessage c `shouldBe` "x: merge side\n"
