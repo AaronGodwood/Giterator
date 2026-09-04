@@ -35,10 +35,11 @@ prefixMessages :: Transform
 prefixMessages = pureTransform (\c -> c {cMessage = "x: " <> cMessage c})
 
 rewrite :: FilePath -> Bool -> Transform -> [ByteString] -> IO Report
-rewrite repo dryRun t = rewriteWith repo dryRun (const t)
+rewrite repo dryRun t = rewriteWith repo dryRun (const (pure t))
 
 rewriteWith :: FilePath -> Bool -> Plan -> [ByteString] -> IO Report
-rewriteWith repo dryRun plan branches = withStore repo (\s -> rewriteBranches s dryRun plan branches)
+rewriteWith repo dryRun plan branches =
+  withStore repo (\s -> rewriteBranches s defaultRewriteOptions {roBranches = branches, roDryRun = dryRun} plan)
 
 dates :: FilePath -> String -> IO [[Int]]
 dates repo rev = map (map (read . BC.unpack) . BC.words) . BC.lines <$> git repo ["log", "--format=%at %ct", rev]
@@ -135,7 +136,7 @@ spec = do
 
   describe "written objects" $
     it "are readable by the same store that wrote them" $ withHistory $ \repo -> withStore repo $ \s -> do
-      _ <- rewriteBranches s False (const prefixMessages) []
+      _ <- rewriteBranches s defaultRewriteOptions (const (pure prefixMessages))
       Just (oid, ObjCommit, _) <- lookupObject s "main"
       c <- readCommit s oid
       cMessage c `shouldBe` "x: merge side\n"

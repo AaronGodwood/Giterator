@@ -11,17 +11,18 @@ import Git.Refs
 import Git.Rewrite
 import Git.Store
 import Git.Types
-import Transform.Time
 import Numeric (showHex)
 import Options.Applicative
 import System.Exit (die, exitFailure)
 import System.IO (hSetBinaryMode, stdout)
+import Transform.Content
+import Transform.Time
 
 data Command
   = Log (Maybe String) (Maybe Int)
   | Show String Bool
   | Verify (Maybe String)
-  | Rewrite [String] Bool TimeOptions
+  | Rewrite RewriteOptions TimeOptions ContentOptions
   | Undo
 
 data Options = Options
@@ -38,7 +39,7 @@ main = do
     Log rev limit -> runLog store rev limit
     Show rev raw  -> runShow store rev raw
     Verify rev    -> runVerify store rev
-    Rewrite branches dryRun timeOpts -> runRewrite store branches dryRun timeOpts
+    Rewrite ro to co -> runRewrite store ro (contentPlan co <> timePlan to)
     Undo          -> runUndo store
 
 cli :: ParserInfo Options
@@ -58,8 +59,23 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
       command "verify" . info (Verify <$> optional revArg) $
         progDesc "Check every commit and tree round-trips byte-exactly (default: all refs)"
     rewriteCmd =
-      command "rewrite" . info (Rewrite <$> many (strArgument (metavar "BRANCH...")) <*> dryRunOpt <*> timeOpts) $
-        progDesc "Rewrite history of the given branches (default: all). Date options apply in the order: spread, shift, jitter, work-hours, tz"
+      command "rewrite" . info (Rewrite <$> rewriteOpts <*> timeOpts <*> contentOpts) $
+        progDesc $
+          "Rewrite history of the given branches (default: all). Content changes apply before date changes; "
+            <> "date options apply in the order: spread, shift, jitter, work-hours, tz"
+    rewriteOpts =
+      RewriteOptions
+        <$> many (utf8 <$> strArgument (metavar "BRANCH..."))
+        <*> switch (long "dry-run" <> help "Show what would change without moving any refs")
+        <*> switch (long "prune-empty" <> help "Drop commits that the rewrite leaves with no changes")
+    contentOpts =
+      ContentOptions
+        <$> ((<>)
+              <$> many (option (eitherReader literalReplacement) (long "replace" <> metavar "OLD=>NEW" <> help "Replace text in every version of every text file"))
+              <*> many (option (eitherReader regexReplacement) (long "replace-regex" <> metavar "REGEX=>NEW" <> help "Like --replace, with a POSIX regex (applied after the literal replacements)")))
+        <*> many (utf8 <$> strOption (long "path" <> metavar "GLOB" <> help "Only apply replacements to matching files (e.g. '*.env', 'src/**/*.hs')"))
+        <*> many (utf8 <$> strOption (long "delete" <> metavar "GLOB" <> help "Remove matching files or directories from every commit"))
+        <*> many (option (eitherReader parseArrow) (long "rename" <> metavar "FROM=>TO" <> help "Move a file or directory in every commit"))
     timeOpts =
       TimeOptions
         <$> option (eitherReader parseWhich) (long "dates" <> metavar "author|committer|both" <> value Both <> help "Which dates to change (default: both)")
@@ -79,7 +95,6 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     undoCmd =
       command "undo" . info (pure Undo) $
         progDesc "Restore the branches and tags from before the most recent rewrite"
-    dryRunOpt = switch (long "dry-run" <> help "Show what would change without moving any refs")
     revArg = strArgument (metavar "REV")
     limitOpt = option auto (short 'n' <> metavar "N" <> help "Show at most N commits")
 
@@ -178,16 +193,19 @@ escape = BS.concatMap $ \w -> case w of
 
 -- rewrite / undo -------------------------------------------------------------
 
-runRewrite :: Store -> [String] -> Bool -> TimeOptions -> IO ()
-runRewrite store branches dryRun timeOpts = do
-  r <- rewriteBranches store dryRun (timePlan timeOpts) (map BC.pack branches)
+runRewrite :: Store -> RewriteOptions -> Plan -> IO ()
+runRewrite store opts plan = do
+  r <- rewriteBranches store opts plan
+  let dryRun = roDryRun opts
   BC.putStrLn $
     "rewrote " <> BC.pack (show (rpCommits r)) <> " commits, "
       <> BC.pack (show (length (rpChanged r))) <> " changed"
+      <> (if null (rpPruned r) then "" else ", " <> BC.pack (show (length (rpPruned r))) <> " dropped as empty")
   when dryRun $ forM_ (rpChanged r) $ \(old, new) -> do
     before <- readCommit store old
     after <- readCommit store new
     let dates
+          | old `elem` rpPruned r = "(dropped)  "
           | cAuthor before == cAuthor after = ""
           | otherwise = formatSignatureDate (cAuthor before) <> " -> " <> formatSignatureDate (cAuthor after) <> "  "
     BC.putStrLn ("  " <> shortHex old <> " -> " <> shortHex new <> "  " <> dates <> BC.takeWhile (/= '\n') (cMessage before))

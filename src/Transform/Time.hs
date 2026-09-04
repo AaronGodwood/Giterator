@@ -56,10 +56,10 @@ defaultTimeOptions = TimeOptions Both Nothing Nothing Nothing "giterator" Nothin
 -- | Applied in a fixed order: spread, shift, jitter, work hours, timezone.
 -- Work hours comes after jitter so jittered times still land inside the window.
 timePlan :: TimeOptions -> Plan
-timePlan o = maybe mempty spread (toSpread o) <> const (mconcat steps)
+timePlan o history = pure (maybe mempty spread (toSpread o) <> mconcat steps)
   where
     w = toWhich o
-    spread target history = case concatMap (datesOf w . snd) history of
+    spread target = case concatMap (datesOf w . snd) history of
       [] -> mempty
       ts -> pureTransform (onDates w (rescale (minimum ts, maximum ts) target))
     steps =

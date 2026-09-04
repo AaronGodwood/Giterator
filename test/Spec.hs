@@ -1,5 +1,6 @@
 module Main (main) where
 
+import ContentSpec qualified
 import ObjectSpec qualified
 import RewriteSpec qualified
 import StoreSpec qualified
@@ -13,3 +14,4 @@ main = hspec . parallel $ do
   describe "Store" StoreSpec.spec
   describe "Rewrite" RewriteSpec.spec
   describe "Time" TimeSpec.spec
+  describe "Content" ContentSpec.spec
