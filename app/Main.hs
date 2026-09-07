@@ -24,6 +24,7 @@ data Command
   | Verify (Maybe String)
   | Rewrite RewriteOptions TimeOptions ContentOptions
   | Undo
+  | Purge Bool
 
 data Options = Options
   { optRepo    :: FilePath
@@ -35,12 +36,14 @@ main = do
   opts <- execParser cli
   -- Names and messages are arbitrary bytes; writing them as-is avoids Windows codepage errors.
   hSetBinaryMode stdout True
-  withStore (optRepo opts) $ \store -> case optCommand opts of
-    Log rev limit -> runLog store rev limit
-    Show rev raw  -> runShow store rev raw
-    Verify rev    -> runVerify store rev
-    Rewrite ro to co -> runRewrite store ro (contentPlan co <> timePlan to)
-    Undo          -> runUndo store
+  let repo = optRepo opts
+  case optCommand opts of
+    Log rev limit    -> withStore repo (\s -> runLog s rev limit)
+    Show rev raw     -> withStore repo (\s -> runShow s rev raw)
+    Verify rev       -> withStore repo (`runVerify` rev)
+    Rewrite ro to co -> withStore repo (\s -> runRewrite s ro (contentPlan co <> timePlan to))
+    Undo             -> withStore repo runUndo
+    Purge confirmed  -> runPurge repo confirmed
 
 cli :: ParserInfo Options
 cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git history")
@@ -48,7 +51,7 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     options =
       Options
         <$> strOption (short 'C' <> metavar "PATH" <> value "." <> showDefault <> help "Repository to operate on")
-        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> undoCmd)
+        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> undoCmd <> purgeCmd)
     logCmd =
       command "log" . info (Log <$> optional revArg <*> optional limitOpt) $
         progDesc "List commits, showing committer date too when it differs from the author's"
@@ -95,6 +98,9 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     undoCmd =
       command "undo" . info (pure Undo) $
         progDesc "Restore the branches and tags from before the most recent rewrite"
+    purgeCmd =
+      command "purge" . info (Purge <$> switch (long "yes" <> help "Confirm: this cannot be undone")) $
+        progDesc "Permanently delete old history: all backups (undo stops working), all reflogs, and unreachable objects"
     revArg = strArgument (metavar "REV")
     limitOpt = option auto (short 'n' <> metavar "N" <> help "Show at most N commits")
 
@@ -229,6 +235,19 @@ runUndo store = undoLatest store >>= \case
     forM_ restores $ \u ->
       BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
     BC.putStrLn ("restored backup #" <> BC.pack (show n))
+
+runPurge :: FilePath -> Bool -> IO ()
+runPurge repo confirmed = do
+  backups <- withStore repo listBackups
+  let described = BC.pack (show (length backups)) <> " backup(s)"
+  unless confirmed . die . BC.unpack $
+    "giterator: purge would permanently delete " <> described
+      <> " (undo will stop working), expire every reflog and prune all unreachable objects.\n"
+      <> "Rerun with --yes to go ahead."
+  withStore repo deleteBackups
+  purgeUnreachable repo
+  BC.putStrLn ("deleted " <> described <> ", expired reflogs and pruned unreachable objects")
+  BC.putStrLn "note: remotes and other clones still have the old history; rewritten branches need a force-push"
 
 -- verify ---------------------------------------------------------------------
 

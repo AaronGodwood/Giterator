@@ -4,6 +4,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
 import Data.Either (fromRight)
 import Fixture
+import Git.Refs (deleteBackups, listBackups, purgeUnreachable)
 import Git.Rewrite
 import Git.Store
 import Test.Hspec
@@ -117,3 +118,13 @@ spec = do
         _ <- run repo defaultContentOptions {coReplace = [literal "abc123=>REDACTED"]} False
         old <- git repo ["log", "-p", "--format=", "refs/giterator/1/old/heads/main"]
         BC.unpack old `shouldContain` "TOKEN=abc123"
+
+    it "is gone from every object in the repo after a purge" $
+      withFixtureRepo secretHistory $ \repo -> do
+        _ <- run repo defaultContentOptions {coReplace = [literal "abc123=>REDACTED"]} False
+        withStore repo deleteBackups
+        purgeUnreachable repo
+        withStore repo listBackups `shouldReturn` []
+        everything <- git repo ["cat-file", "--batch-all-objects", "--batch"]
+        BC.unpack everything `shouldNotContain` "TOKEN=abc123"
+        BC.unpack everything `shouldContain` "TOKEN=REDACTED"

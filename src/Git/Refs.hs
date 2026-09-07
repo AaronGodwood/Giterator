@@ -11,6 +11,9 @@ module Git.Refs
   , planRefUpdates
   , applyRefUpdates
   , undoLatest
+  , listBackups
+  , deleteBackups
+  , purgeUnreachable
   , ensureClean
   , syncWorktree
   ) where
@@ -19,12 +22,13 @@ import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
-import Data.List (find)
+import Data.List (find, nub, sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Git.Store
 import Git.Types
+import System.Process.Typed (nullStream, proc, runProcess_, setStdout, setWorkingDir)
 
 data Ref = Ref
   { refName   :: ByteString
@@ -124,6 +128,29 @@ undoLatest s = do
       runGitInput s ["update-ref", "--stdin"] (foldMap commands restores)
       syncWorktree s
       pure (Just (n, restores))
+
+listBackups :: Store -> IO [Int]
+listBackups s = nub . sort . map fst . mapMaybe parseBackup <$> listRefs s ["refs/giterator/"]
+
+deleteBackups :: Store -> IO ()
+deleteBackups s = do
+  refs <- listRefs s ["refs/giterator/"]
+  unless (null refs) $
+    runGitInput s ["update-ref", "--stdin"] $
+      foldMap (\r -> "delete " <> refName r <> " " <> oidToHex (refTarget r) <> "\n") refs
+
+-- | Make unreferenced objects (old history, dry-run leftovers) actually go
+-- away: reflogs would otherwise keep old commits alive for 90 days.
+--
+-- Takes a path rather than a 'Store' on purpose: gc deletes pack files, and on
+-- Windows it can't delete one that our cat-file process has open (Git for
+-- Windows then stops to ask "Should I try again?"), so the store must be closed.
+purgeUnreachable :: FilePath -> IO ()
+purgeUnreachable repo = do
+  run ["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]
+  run ["gc", "--prune=now", "--quiet"]
+  where
+    run args = runProcess_ (setStdout nullStream . setWorkingDir repo $ proc "git" args)
 
 isBare :: Store -> IO Bool
 isBare s = (== "true") . BC.strip <$> runGit s ["rev-parse", "--is-bare-repository"]
