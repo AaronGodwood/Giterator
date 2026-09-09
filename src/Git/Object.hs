@@ -10,6 +10,9 @@ module Git.Object
   , renderTree
   , parseSignature
   , renderSignature
+  , isSigned
+  , stripSignature
+  , authorTimeOffset
   , objectHeader
   , hashObject
   , checkRoundTrip
@@ -103,6 +106,28 @@ renderCommit c = foldMap renderHeader headers <> "\n" <> cMessage c
            , ("committer", renderSignature (cCommitter c))
            ]
         <> cExtra c
+
+isSigned :: Commit -> Bool
+isSigned = any (isSignatureHeader . fst) . cExtra
+
+-- | A signature covers the exact commit bytes, so any rewrite invalidates it.
+-- Dropping it is more honest than leaving one that fails verification.
+-- (mergetag headers stay: they sign the merged tag, not this commit.)
+stripSignature :: Commit -> Commit
+stripSignature c = c {cExtra = filter (not . isSignatureHeader . fst) (cExtra c)}
+
+isSignatureHeader :: ByteString -> Bool
+isSignatureHeader k = k == "gpgsig" || k == "gpgsig-sha256"
+
+-- | Byte offset in 'renderCommit' output where the author's timestamp digits start.
+authorTimeOffset :: Commit -> Int
+authorTimeOffset c =
+  BS.length $
+    renderHeader ("tree", oidToHex (cTree c))
+      <> foldMap (renderHeader . ("parent",) . oidToHex) (cParents c)
+      <> "author " <> sigName a <> " <" <> sigEmail a <> "> "
+  where
+    a = cAuthor c
 
 -- | Header lines are @key value@; a line starting with a space continues the
 -- previous value (this is how multi-line gpgsig blocks are stored).

@@ -21,7 +21,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Git.Object (hashObject, renderCommit)
+import Git.Object (hashObject, isSigned, renderCommit, stripSignature)
 import Git.Refs
 import Git.Store
 import Git.Types
@@ -60,10 +60,18 @@ data Rewritten = Rewritten
     -- @git log@ without @--topo-order@) will show them out of place.
   , rwPruned     :: [Oid]
     -- ^ Original commits dropped because the rewrite left them changing nothing.
+  , rwUnsigned   :: [Oid]
+    -- ^ Original commits whose signature was dropped because they changed.
   }
 
--- | Tree and committer time of each new commit, for pruning and ordering checks.
-data Fold = Fold !(Map Oid Oid) !(Map Oid (Oid, Int64)) [Oid] [Oid]
+data Fold = Fold
+  { fMapping   :: !(Map Oid Oid)
+  , fNewInfo   :: !(Map Oid (Oid, Int64))
+    -- ^ Tree and committer time of each new commit, for pruning and ordering checks.
+  , fBackwards :: [Oid]
+  , fPruned    :: [Oid]
+  , fUnsigned  :: [Oid]
+  }
 
 -- | Commits must be in topological order, parents first. Parents are remapped
 -- before the transform runs, so transforms see final parent ids (vanity mining
@@ -73,8 +81,8 @@ data Fold = Fold !(Map Oid Oid) !(Map Oid (Oid, Int64)) [Oid] [Oid]
 -- is dropped (its id maps to the parent), unless it was already empty before.
 rewriteCommits :: Store -> Bool -> Transform -> [(Oid, Commit)] -> IO Rewritten
 rewriteCommits store prune t history = do
-  Fold mapping _ backwards pruned <- foldM step (Fold Map.empty Map.empty [] []) history
-  pure (Rewritten mapping (reverse backwards) (reverse pruned))
+  f <- foldM step (Fold Map.empty Map.empty [] [] []) history
+  pure (Rewritten (fMapping f) (reverse (fBackwards f)) (reverse (fPruned f)) (reverse (fUnsigned f)))
   where
     original = Map.fromList [(o, (cTree c, committerTime c)) | (o, c) <- history]
     committerTime = sigTime . cCommitter
@@ -83,26 +91,29 @@ rewriteCommits store prune t history = do
       [p] | Just (tree, _) <- Map.lookup p info -> tree == cTree c
       _ -> False
 
-    step (Fold mapping newInfo backwards pruned) (oid, c) = do
-      let remapped = c {cParents = map (\p -> Map.findWithDefault p p mapping) (cParents c)}
-      c' <- runReaderT (runTransform t oid remapped) store
+    step f (oid, c) = do
+      let remapped = c {cParents = map (\p -> Map.findWithDefault p p (fMapping f)) (cParents c)}
+      transformed <- runReaderT (runTransform t oid remapped) store
+      let c' = if transformed /= c then stripSignature transformed else transformed
+          unsigned = if isSigned c && not (isSigned c') then oid : fUnsigned f else fUnsigned f
       case cParents c' of
         [parent]
-          | prune && sameTreeAsParent newInfo c' && not (sameTreeAsParent original c) ->
-              pure (Fold (Map.insert oid parent mapping) newInfo backwards (oid : pruned))
+          | prune && sameTreeAsParent (fNewInfo f) c' && not (sameTreeAsParent original c) ->
+              pure f {fMapping = Map.insert oid parent (fMapping f), fPruned = oid : fPruned f}
         _ -> do
           let body = renderCommit c'
               new = hashObject ObjCommit body
               time = committerTime c'
-              nowBackwards = newerThan newInfo time (cParents c')
+              nowBackwards = newerThan (fNewInfo f) time (cParents c')
               wasBackwards = newerThan original (committerTime c) (cParents c)
           unless (new == oid) $ void (writeObject store ObjCommit body)
-          pure $
-            Fold
-              (Map.insert oid new mapping)
-              (Map.insert new (cTree c', time) newInfo)
-              (if nowBackwards && not wasBackwards then new : backwards else backwards)
-              pruned
+          pure
+            f
+              { fMapping = Map.insert oid new (fMapping f)
+              , fNewInfo = Map.insert new (cTree c', time) (fNewInfo f)
+              , fBackwards = if nowBackwards && not wasBackwards then new : fBackwards f else fBackwards f
+              , fUnsigned = unsigned
+              }
 
 data RewriteOptions = RewriteOptions
   { roBranches   :: [ByteString]
@@ -120,6 +131,7 @@ data Report = Report
     -- ^ Oldest first. A pruned commit maps to its parent's new id.
   , rpOutOfOrder :: [Oid]
   , rpPruned :: [Oid]
+  , rpUnsigned :: [Oid]
   , rpUpdates :: [RefUpdate]
   , rpSkippedTags :: [Ref]
   , rpBackup :: Maybe Int
@@ -141,7 +153,7 @@ rewriteBranches store opts plan = do
   oids <- revList store (["--topo-order", "--reverse", "--end-of-options"] <> map (BC.unpack . refName) branches)
   history <- traverse (\o -> (o,) <$> readCommit store o) oids
   transform <- plan history
-  Rewritten mapping backwards pruned <- rewriteCommits store (roPruneEmpty opts) transform history
+  Rewritten mapping backwards pruned unsigned <- rewriteCommits store (roPruneEmpty opts) transform history
   flushObjects store
   tags <- listRefs store ["refs/tags/"]
   let (updates, skipped) = planRefUpdates mapping (branches <> tags)
@@ -150,4 +162,4 @@ rewriteBranches store opts plan = do
     if roDryRun opts || null updates
       then pure Nothing
       else Just <$> applyRefUpdates store updates <* syncWorktree store
-  pure (Report (length oids) changed backwards pruned updates skipped backup)
+  pure (Report (length oids) changed backwards pruned unsigned updates skipped backup)

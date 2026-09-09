@@ -14,9 +14,11 @@ import Git.Types
 import Numeric (showHex)
 import Options.Applicative
 import System.Exit (die, exitFailure)
-import System.IO (hSetBinaryMode, stdout)
+import Control.Exception (SomeException, try)
+import System.IO (hFlush, hSetBinaryMode, stdout)
 import Transform.Content
 import Transform.Time
+import Transform.Vanity
 
 data Command
   = Log (Maybe String) (Maybe Int)
@@ -25,6 +27,7 @@ data Command
   | Rewrite RewriteOptions TimeOptions ContentOptions
   | Undo
   | Purge Bool
+  | Vanity RewriteOptions VanityOptions
 
 data Options = Options
   { optRepo    :: FilePath
@@ -44,6 +47,7 @@ main = do
     Rewrite ro to co -> withStore repo (\s -> runRewrite s ro (contentPlan co <> timePlan to))
     Undo             -> withStore repo runUndo
     Purge confirmed  -> runPurge repo confirmed
+    Vanity ro vo     -> withStore repo (\s -> runVanity s ro vo)
 
 cli :: ParserInfo Options
 cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git history")
@@ -51,7 +55,7 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     options =
       Options
         <$> strOption (short 'C' <> metavar "PATH" <> value "." <> showDefault <> help "Repository to operate on")
-        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> undoCmd <> purgeCmd)
+        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> vanityCmd <> undoCmd <> purgeCmd)
     logCmd =
       command "log" . info (Log <$> optional revArg <*> optional limitOpt) $
         progDesc "List commits, showing committer date too when it differs from the author's"
@@ -98,6 +102,23 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     undoCmd =
       command "undo" . info (pure Undo) $
         progDesc "Restore the branches and tags from before the most recent rewrite"
+    vanityCmd =
+      command "vanity" . info (Vanity <$> vanityRewriteOpts <*> vanityOpts) $
+        progDesc "Give branch tips (or with --chain, every commit) an id starting with a chosen hex prefix"
+    vanityRewriteOpts =
+      RewriteOptions
+        <$> many (utf8 <$> strArgument (metavar "BRANCH..." <> help "Default: the current branch"))
+        <*> switch (long "dry-run" <> help "Show what would change without moving any refs")
+        <*> pure False
+    vanityOpts =
+      VanityOptions
+        <$> option (eitherReader parseTarget) (long "prefix" <> metavar "HEX" <> help "Wanted start of the commit id, e.g. cafe")
+        <*> option (eitherReader parseMethod) (long "method" <> metavar "whitespace|seconds" <> value Whitespace <> help "Hide the search in trailing whitespace in the message (default), or in the timestamps' seconds")
+        <*> switch (long "chain" <> help "Mine every commit in the rewritten history, not just the tips")
+    parseMethod = \case
+      "whitespace" -> Right Whitespace
+      "seconds" -> Right Seconds
+      s -> Left ("expected whitespace or seconds, not " <> show s)
     purgeCmd =
       command "purge" . info (Purge <$> switch (long "yes" <> help "Confirm: this cannot be undone")) $
         progDesc "Permanently delete old history: all backups (undo stops working), all reflogs, and unreachable objects"
@@ -219,6 +240,10 @@ runRewrite store opts plan = do
     BC.putStrLn $
       "warning: " <> BC.pack (show (length (rpOutOfOrder r)))
         <> " commit(s) now have a committer date before their parent's; date-sorted views such as GitHub will show them out of order"
+  unless (null (rpUnsigned r)) $
+    BC.putStrLn $
+      "warning: " <> BC.pack (show (length (rpUnsigned r)))
+        <> " signed commit(s) changed, so their signatures were removed (they would no longer verify)"
   forM_ (rpUpdates r) $ \u ->
     BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
   forM_ (rpSkippedTags r) $ \t ->
@@ -235,6 +260,20 @@ runUndo store = undoLatest store >>= \case
     forM_ restores $ \u ->
       BC.putStrLn ("  " <> ruRef u <> "  " <> shortHex (ruOld u) <> " -> " <> shortHex (ruNew u))
     BC.putStrLn ("restored backup #" <> BC.pack (show n))
+
+runVanity :: Store -> RewriteOptions -> VanityOptions -> IO ()
+runVanity store opts vo = do
+  branches <-
+    if null (roBranches opts)
+      then try (runGit store ["symbolic-ref", "-q", "HEAD"]) >>= \case
+        Right ref -> pure [BC.strip ref]
+        Left (_ :: SomeException) -> die "giterator: HEAD is detached; name a branch to mine"
+      else pure (roBranches opts)
+  runRewrite store opts {roBranches = branches} (vanityPlan vo reportMined)
+  where
+    reportMined old new tries = do
+      BC.putStrLn ("  mined " <> shortHex old <> " -> " <> oidToHex new <> "  (" <> BC.pack (show tries) <> " attempts)")
+      hFlush stdout
 
 runPurge :: FilePath -> Bool -> IO ()
 runPurge repo confirmed = do

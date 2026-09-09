@@ -4,6 +4,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Fixture
+import Git.Object (renderCommit)
 import Git.Refs
 import Git.Rewrite
 import Git.Store
@@ -133,6 +134,27 @@ spec = do
       length (rpOutOfOrder r) `shouldBe` 1
       r' <- rewrite repo False prefixMessages []
       rpOutOfOrder r' `shouldBe` []
+
+  describe "signed commits" $ do
+    let signTip repo = withStore repo $ \s -> do
+          c <- readCommit s =<< maybe (fail "no main") (\(o, _, _) -> pure o) =<< lookupObject s "main"
+          let signed = c {cExtra = [("gpgsig", "-----BEGIN PGP SIGNATURE-----\n\nfake\n-----END PGP SIGNATURE-----")]}
+          new <- writeObject s ObjCommit (renderCommit signed)
+          flushObjects s
+          () <$ runGit s ["update-ref", "refs/heads/main", BC.unpack (oidToHex new)]
+        gpgsig repo = BC.isInfixOf "gpgsig" <$> git repo ["cat-file", "commit", "main"]
+
+    it "keep their signature when unchanged" $ withHistory $ \repo -> do
+      signTip repo
+      r <- rewrite repo False mempty []
+      rpUnsigned r `shouldBe` []
+      gpgsig repo `shouldReturn` True
+
+    it "lose their signature when changed" $ withHistory $ \repo -> do
+      signTip repo
+      r <- rewrite repo False prefixMessages []
+      length (rpUnsigned r) `shouldBe` 1
+      gpgsig repo `shouldReturn` False
 
   describe "written objects" $
     it "are readable by the same store that wrote them" $ withHistory $ \repo -> withStore repo $ \s -> do

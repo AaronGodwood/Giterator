@@ -27,6 +27,7 @@ library
                       Git.Rewrite
                       Transform.Time
                       Transform.Content
+                      Transform.Vanity
     build-depends:    base16-bytestring >=1.0 && <1.1
                     , containers >=0.6 && <0.8
                     , cryptohash-sha1 >=0.11 && <0.12
@@ -40,6 +41,8 @@ executable giterator
     import:           shared
     hs-source-dirs:   app
     main-is:          Main.hs
+    -- Threaded with all cores for parallel vanity mining.
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
     build-depends:    giterator
                     , optparse-applicative >=0.17 && <0.19
 
@@ -56,6 +59,7 @@ test-suite giterator-test
                       RewriteSpec
                       TimeSpec
                       ContentSpec
+                      VanitySpec
     build-depends:    giterator
                     , hspec >=2.10 && <3
                     , QuickCheck >=2.14 && <2.16
