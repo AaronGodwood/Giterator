@@ -69,7 +69,7 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
       command "rewrite" . info (Rewrite <$> rewriteOpts <*> timeOpts <*> contentOpts) $
         progDesc $
           "Rewrite history of the given branches (default: all). Content changes apply before date changes; "
-            <> "date options apply in the order: spread, shift, jitter, work-hours, tz"
+            <> "date options apply in the order: spread, shift, jitter, weekdays, work-hours, tz"
     rewriteOpts =
       RewriteOptions
         <$> many (utf8 <$> strArgument (metavar "BRANCH..."))
@@ -90,6 +90,7 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
         <*> optional (option (eitherReader parseDuration) (long "shift" <> metavar "DURATION" <> help "Move every date by DURATION (e.g. 3d, -2h30m)"))
         <*> optional (option (eitherReader parseDuration) (long "jitter" <> metavar "DURATION" <> help "Move each commit by a reproducible random offset of up to ±DURATION"))
         <*> (BC.pack <$> strOption (long "seed" <> metavar "TEXT" <> value "giterator" <> help "Seed for --jitter"))
+        <*> switch (long "weekdays" <> help "Keep commits off weekends: Friday to Sunday is squeezed into Friday, Monday to Thursday are untouched")
         <*> optional (option (eitherReader parseWindow) (long "work-hours" <> metavar "HH:MM-HH:MM" <> help "Squeeze each day's commits into these local hours"))
         <*> ((\tz mode -> (,mode) <$> tz)
               <$> optional (option (eitherReader parseTz) (long "tz" <> metavar "+HHMM" <> help "Set the timezone (keeps the instant, so the local clock time changes)"))

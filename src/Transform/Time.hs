@@ -10,6 +10,7 @@ module Transform.Time
   , shiftBy
   , rescale
   , jitter
+  , weekdays
   , workHours
   , setTz
   , parseDuration
@@ -45,16 +46,18 @@ data TimeOptions = TimeOptions
   , toShift  :: Maybe Int64
   , toJitter :: Maybe Int64
   , toSeed   :: ByteString
+  , toWeekdays :: Bool
   , toWindow :: Maybe (Int64, Int64)
   , toTz     :: Maybe (ByteString, TzMode)
   }
   deriving (Show)
 
 defaultTimeOptions :: TimeOptions
-defaultTimeOptions = TimeOptions Both Nothing Nothing Nothing "giterator" Nothing Nothing
+defaultTimeOptions = TimeOptions Both Nothing Nothing Nothing "giterator" False Nothing Nothing
 
--- | Applied in a fixed order: spread, shift, jitter, work hours, timezone.
--- Work hours comes after jitter so jittered times still land inside the window.
+-- | Applied in a fixed order: spread, shift, jitter, weekdays, work hours, timezone.
+-- Weekdays and work hours come after jitter so jittered times still land
+-- inside them, and work hours never changes the day, so weekdays holds.
 timePlan :: TimeOptions -> Plan
 timePlan o history = pure (maybe mempty spread (toSpread o) <> mconcat steps)
   where
@@ -66,6 +69,7 @@ timePlan o history = pure (maybe mempty spread (toSpread o) <> mconcat steps)
       catMaybes
         [ pureTransform . onDates w . shiftBy <$> toShift o
         , (\j -> withOriginal (onDates w . jitter (toSeed o) j)) <$> toJitter o
+        , if toWeekdays o then Just (pureTransform (onDates w weekdays)) else Nothing
         , pureTransform . onDates w . workHours <$> toWindow o
         , (\(tz, mode) -> pureTransform (onDates w (setTz mode tz))) <$> toTz o
         ]
@@ -104,6 +108,21 @@ jitter seed range oid s
   where
     digest = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) (0 :: Word64) (BS.take 8 (SHA1.hash (seed <> oidToRaw oid)))
     offset = fromIntegral (digest `mod` fromIntegral (2 * range + 1)) - range
+
+-- | Keep every commit on a weekday (in its own timezone): Friday to Sunday is
+-- squeezed linearly into Friday, and Monday to Thursday are left untouched.
+-- Only moving the end of the week keeps order while disturbing as little as possible.
+weekdays :: Signature -> Signature
+weekdays s
+  | intoWeek < fridayStart = s
+  | otherwise = s {sigTime = sigTime s + squeezed - intoWeek}
+  where
+    off = 60 * fromIntegral (fromMaybe 0 (tzOffsetMinutes (sigTz s)))
+    (day, sod) = (sigTime s + off) `divMod` 86400
+    -- 1970-01-01 was a Thursday, so +3 makes Monday 0.
+    intoWeek = ((day + 3) `mod` 7) * 86400 + sod
+    fridayStart = 4 * 86400
+    squeezed = fridayStart + (intoWeek - fridayStart) `div` 3
 
 -- | Squeeze each local day linearly into @[start, end)@ (seconds since local
 -- midnight). Every commit is mapped, even ones already inside the window: a map

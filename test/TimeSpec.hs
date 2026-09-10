@@ -25,6 +25,10 @@ sigAt = Signature "A" "a@example.com"
 localSecondOfDay :: Signature -> Int64
 localSecondOfDay s = (sigTime s + 60 * fromIntegral (fromMaybe 0 (tzOffsetMinutes (sigTz s)))) `mod` 86400
 
+-- | Monday is 0; 1970-01-01 was a Thursday.
+localWeekday :: Signature -> Int64
+localWeekday s = ((sigTime s + 60 * fromIntegral (fromMaybe 0 (tzOffsetMinutes (sigTz s)))) `div` 86400 + 3) `mod` 7
+
 genWindow :: Gen (Int64, Int64)
 genWindow = do
   a <- choose (0, 86399)
@@ -62,6 +66,21 @@ spec = do
     it "depends on the seed" $
       length (nub [sigTime (jitter seed 100000 exampleOid (sigAt 1700000000 "+0000")) | seed <- ["a", "b", "c", "d"]])
         `shouldSatisfy` (> 1)
+
+  describe "weekdays" $ do
+    prop "puts every commit on Monday to Friday, in local time" $
+      forAll ((,) <$> realisticTime <*> genTz) $ \(t, tz) ->
+        localWeekday (weekdays (sigAt t tz)) < 5
+    prop "leaves Monday to Thursday untouched" $
+      forAll ((,) <$> realisticTime <*> genTz) $ \(t, tz) ->
+        localWeekday (sigAt t tz) < 4 ==> weekdays (sigAt t tz) === sigAt t tz
+    prop "keeps commits in order" $
+      forAll ((,,) <$> realisticTime <*> realisticTime <*> genTz) $ \(t1, t2, tz) ->
+        let f t = sigTime (weekdays (sigAt t tz))
+         in f (min t1 t2) <= f (max t1 t2)
+    it "squeezes Sunday night into late Friday" $
+      -- Sunday 2024-01-07 23:00 UTC is 71h into Fri-Sun; 71h / 3 = Friday 23:40.
+      sigTime (weekdays (sigAt 1704668400 "+0000")) `shouldBe` 1704498000
 
   describe "workHours" $ do
     prop "lands every commit inside the window, in local time" $
