@@ -8,6 +8,7 @@ module Git.Refs
   , RefUpdate (..)
   , listRefs
   , resolveBranch
+  , currentBranch
   , planRefUpdates
   , applyRefUpdates
   , undoLatest
@@ -18,7 +19,9 @@ module Git.Refs
   , syncWorktree
   ) where
 
-import Control.Monad (unless)
+import Control.Exception (SomeException, try)
+import Control.Monad (unless, void)
+import Data.Functor ((<&>))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
@@ -61,6 +64,13 @@ resolveBranch s name = do
   let full = if "refs/heads/" `BS.isPrefixOf` name then name else "refs/heads/" <> name
   refs <- listRefs s [BC.unpack full]
   maybe (fail ("not a branch: " <> BC.unpack name)) pure (find ((== full) . refName) refs)
+
+-- | The checked-out branch as a full ref name, or Nothing when HEAD is detached.
+currentBranch :: Store -> IO (Maybe ByteString)
+currentBranch s =
+  try (runGit s ["symbolic-ref", "-q", "HEAD"]) <&> \case
+    Right ref -> Just (BC.strip ref)
+    Left (_ :: SomeException) -> Nothing
 
 -- | Refs whose commit was rewritten move to the new commit. Annotated tags are
 -- returned separately: moving them means rewriting the tag object, which we don't do yet.
@@ -169,4 +179,4 @@ ensureClean s = do
 syncWorktree :: Store -> IO ()
 syncWorktree s = do
   bare <- isBare s
-  unless bare $ () <$ runGit s ["reset", "--hard", "-q"]
+  unless bare . void $ runGit s ["reset", "--hard", "-q"]

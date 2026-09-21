@@ -6,6 +6,7 @@ import RewriteSpec qualified
 import StoreSpec qualified
 import Test.Hspec
 import TimeSpec qualified
+import TuiSpec qualified
 import VanitySpec qualified
 
 main :: IO ()
@@ -17,3 +18,4 @@ main = hspec . parallel $ do
   describe "Time" TimeSpec.spec
   describe "Content" ContentSpec.spec
   describe "Vanity" VanitySpec.spec
+  describe "Tui" TuiSpec.spec

@@ -2,23 +2,22 @@ module Main (main) where
 
 import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.Maybe (fromMaybe)
 import Git.Date (formatSignatureDate)
 import Git.Object
+import Git.Pretty
 import Git.Refs
 import Git.Rewrite
 import Git.Store
 import Git.Types
-import Numeric (showHex)
 import Options.Applicative
 import System.Exit (die, exitFailure)
-import Control.Exception (SomeException, try)
 import System.IO (hFlush, hSetBinaryMode, stdout)
 import Transform.Content
 import Transform.Time
 import Transform.Vanity
+import Tui.Run (runTui)
 
 data Command
   = Log (Maybe String) (Maybe Int)
@@ -28,6 +27,7 @@ data Command
   | Undo
   | Purge Bool
   | Vanity RewriteOptions VanityOptions
+  | Tui (Maybe ByteString)
 
 data Options = Options
   { optRepo    :: FilePath
@@ -37,17 +37,19 @@ data Options = Options
 main :: IO ()
 main = do
   opts <- execParser cli
-  -- Names and messages are arbitrary bytes; writing them as-is avoids Windows codepage errors.
-  hSetBinaryMode stdout True
   let repo = optRepo opts
+      -- Names and messages are arbitrary bytes; writing them as-is avoids Windows
+      -- codepage errors. Not for the TUI: vty draws through the normal text handle.
+      bytes act = hSetBinaryMode stdout True >> act
   case optCommand opts of
-    Log rev limit    -> withStore repo (\s -> runLog s rev limit)
-    Show rev raw     -> withStore repo (\s -> runShow s rev raw)
-    Verify rev       -> withStore repo (`runVerify` rev)
-    Rewrite ro to co -> withStore repo (\s -> runRewrite s ro (contentPlan co <> timePlan to))
-    Undo             -> withStore repo runUndo
-    Purge confirmed  -> runPurge repo confirmed
-    Vanity ro vo     -> withStore repo (\s -> runVanity s ro vo)
+    Tui branch       -> runTui repo branch
+    Log rev limit    -> bytes $ withStore repo (\s -> runLog s rev limit)
+    Show rev raw     -> bytes $ withStore repo (\s -> runShow s rev raw)
+    Verify rev       -> bytes $ withStore repo (`runVerify` rev)
+    Rewrite ro to co -> bytes $ withStore repo (\s -> runRewrite s ro (contentPlan co <> timePlan to))
+    Undo             -> bytes $ withStore repo runUndo
+    Purge confirmed  -> bytes $ runPurge repo confirmed
+    Vanity ro vo     -> bytes $ withStore repo (\s -> runVanity s ro vo)
 
 cli :: ParserInfo Options
 cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git history")
@@ -55,7 +57,10 @@ cli = info (options <**> helper) (fullDesc <> progDesc "Inspect and rewrite git 
     options =
       Options
         <$> strOption (short 'C' <> metavar "PATH" <> value "." <> showDefault <> help "Repository to operate on")
-        <*> hsubparser (logCmd <> showCmd <> verifyCmd <> rewriteCmd <> vanityCmd <> undoCmd <> purgeCmd)
+        <*> hsubparser (tuiCmd <> logCmd <> showCmd <> verifyCmd <> rewriteCmd <> vanityCmd <> undoCmd <> purgeCmd)
+    tuiCmd =
+      command "tui" . info (Tui <$> optional (utf8 <$> strArgument (metavar "BRANCH" <> help "Default: the current branch"))) $
+        progDesc "Browse history interactively"
     logCmd =
       command "log" . info (Log <$> optional revArg <*> optional limitOpt) $
         progDesc "List commits, showing committer date too when it differs from the author's"
@@ -134,90 +139,12 @@ runLog store rev limit = do
     ["--topo-order"] <> foldMap (\n -> ["-n", show n]) limit <> ["--end-of-options", fromMaybe "HEAD" rev]
   forM_ oids $ \oid -> readCommit store oid >>= BC.putStr . logEntry oid
 
-logEntry :: Oid -> Commit -> ByteString
-logEntry oid c = BS.concat [headline, committedLine]
-  where
-    a = cAuthor c
-    k = cCommitter c
-    mark = if length (cParents c) > 1 then " M " else "   "
-    subject = BC.takeWhile (/= '\n') (cMessage c)
-    headline = shortHex oid <> mark <> formatSignatureDate a <> "  " <> sigName a <> "  " <> subject <> "\n"
-    sameWho = (sigName a, sigEmail a) == (sigName k, sigEmail k)
-    sameWhen = (sigTime a, sigTz a) == (sigTime k, sigTz k)
-    committedLine
-      | sameWho && sameWhen = ""
-      | otherwise =
-          BC.replicate 10 ' ' <> "committed " <> formatSignatureDate k
-            <> (if sameWho then "" else "  by " <> sigName k) <> "\n"
-
 -- show -----------------------------------------------------------------------
 
 runShow :: Store -> String -> Bool -> IO ()
 runShow store rev raw = lookupObject store (BC.pack rev) >>= \case
   Nothing -> die ("giterator: unknown object " <> rev)
   Just (oid, t, body) -> BC.putStr ((if raw then showRaw else showPretty) oid t body)
-
-showPretty :: Oid -> ObjectType -> ByteString -> ByteString
-showPretty oid t body = case t of
-  ObjCommit | Just c <- parseCommit body -> prettyCommit oid c
-  ObjTree | Just tree <- parseTree body -> foldMap prettyEntry tree
-  _ -> body
-
-prettyCommit :: Oid -> Commit -> ByteString
-prettyCommit oid c =
-  BS.concat $
-    [field "commit" (oidToHex oid), field "tree" (oidToHex (cTree c))]
-      <> map (field "parent" . oidToHex) (cParents c)
-      <> [field "author" (sig (cAuthor c)), field "committer" (sig (cCommitter c))]
-      <> [field k (summarise v) | (k, v) <- cExtra c]
-      <> ["\n"]
-      <> map (\l -> "    " <> l <> "\n") (BC.lines (cMessage c))
-  where
-    field k v = k <> BC.replicate (max 1 (10 - BS.length k)) ' ' <> v <> "\n"
-    sig s = sigName s <> " <" <> sigEmail s <> ">  " <> formatSignatureDate s <> "  (unix " <> BC.pack (show (sigTime s)) <> ")"
-    summarise v = case BC.lines v of
-      [l] -> l
-      ls -> "(" <> BC.pack (show (length ls)) <> " lines)"
-
-prettyEntry :: TreeEntry -> ByteString
-prettyEntry e = teMode e <> " " <> kind <> " " <> oidToHex (teOid e) <> "\t" <> teName e <> "\n"
-  where
-    kind = case teMode e of
-      m | m `elem` ["40000", "040000"] -> "tree  "
-      "160000" -> "commit"
-      _ -> "blob  "
-
-showRaw :: Oid -> ObjectType -> ByteString -> ByteString
-showRaw oid t body =
-  BS.concat
-    [ "type:    ", objectTypeName t, "\n"
-    , "size:    ", BC.pack (show (BS.length body)), " bytes\n"
-    , "hashed:  sha1(\"", escape (objectHeader t body), "\" <> body)\n"
-    , "result:  ", oidToHex computed, verdict, "\n"
-    , "---\n"
-    , rawBody
-    ]
-  where
-    computed = hashObject t body
-    verdict
-      | computed == oid = "  (matches git)"
-      | otherwise = "  (MISMATCH: git says " <> oidToHex oid <> ")"
-    rawBody = case t of
-      ObjTree | Just tree <- parseTree body ->
-        "(one entry per line for readability; the real bytes have no newlines)\n"
-          <> foldMap (\e -> escape (teMode e <> " " <> teName e <> "\0") <> escape (oidToRaw (teOid e)) <> "\n") tree
-      _ -> body <> (if "\n" `BS.isSuffixOf` body then "" else "\n")
-
--- | Printable ASCII and newlines as-is; everything else as @\\0@ or @\\xHH@.
-escape :: ByteString -> ByteString
-escape = BS.concatMap $ \w -> case w of
-  0 -> "\\0"
-  92 -> "\\\\"
-  10 -> "\n"
-  _ | w >= 0x20 && w < 0x7f -> BS.singleton w
-    | otherwise -> "\\x" <> BC.pack (pad (showHex w ""))
-  where
-    pad s = replicate (2 - length s) '0' <> s
 
 -- rewrite / undo -------------------------------------------------------------
 
@@ -266,9 +193,7 @@ runVanity :: Store -> RewriteOptions -> VanityOptions -> IO ()
 runVanity store opts vo = do
   branches <-
     if null (roBranches opts)
-      then try (runGit store ["symbolic-ref", "-q", "HEAD"]) >>= \case
-        Right ref -> pure [BC.strip ref]
-        Left (_ :: SomeException) -> die "giterator: HEAD is detached; name a branch to mine"
+      then maybe (die "giterator: HEAD is detached; name a branch to mine") (pure . pure) =<< currentBranch store
       else pure (roBranches opts)
   runRewrite store opts {roBranches = branches} (vanityPlan vo reportMined)
   where
