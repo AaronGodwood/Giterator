@@ -29,11 +29,15 @@ library
                       Transform.Content
                       Transform.Vanity
                       Git.Pretty
+                      Tui.Name
+                      Tui.Form
+                      Tui.Preview
                       Tui.Model
                       Tui.View
                       Tui.Run
     build-depends:    base16-bytestring >=1.0 && <1.1
                     , brick >=2.1 && <2.14
+                    , microlens >=0.4 && <0.6
                     , text >=2.0 && <2.2
                     , vector >=0.12 && <0.14
                     , vty >=6.0 && <6.7

@@ -11,6 +11,7 @@ module Git.Store
   , readTree
   , writeObject
   , flushObjects
+  , discardObjects
   , revList
   , runGit
   , runGitInput
@@ -21,7 +22,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Git.Object (hashObject, parseCommit, parseTree)
@@ -83,6 +84,12 @@ flushObjects s = do
   objects <- atomicModifyIORef' (storePending s) (\(Pending m _) -> (Pending Map.empty 0, Map.elems m))
   unless (null objects) $
     runGitInput s ["index-pack", "--stdin"] (buildPack objects)
+
+-- | Forget pending objects without writing them: previews build whole new
+-- histories in memory and then throw them away. (A preview big enough to
+-- pass 'flushThreshold' still writes a pack, but nothing references it.)
+discardObjects :: Store -> IO ()
+discardObjects s = atomicWriteIORef (storePending s) (Pending Map.empty 0)
 
 -- | Look up any name git understands (@HEAD@, @main~2@, @HEAD:README.md@, a hash).
 -- Only sees flushed objects; 'readObject' also sees pending ones.
