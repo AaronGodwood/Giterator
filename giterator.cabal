@@ -6,7 +6,7 @@ license:            NONE
 author:             Aaron Godwood
 maintainer:         azmclaz@gmail.com
 build-type:         Simple
-extra-doc-files:    plan.md
+extra-doc-files:    README.md
 
 common shared
     default-language: GHC2021
