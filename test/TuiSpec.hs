@@ -1,6 +1,6 @@
 module TuiSpec (spec) where
 
-import Brick.Widgets.List (listSelected)
+import Brick.Widgets.List (listElements, listMoveDown, listSelected)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.Maybe (fromMaybe, isNothing)
@@ -15,6 +15,7 @@ import Transform.Content (ContentOptions (..))
 import Transform.Time (TimeOptions (..))
 import Tui.Form
 import Tui.Model
+import Git.Rewrite (Report (..))
 import Tui.Preview
 
 commit :: ByteString -> Commit
@@ -34,6 +35,9 @@ isRight' :: Either [(Name, String)] (Maybe PreviewSpec) -> Maybe () -> Expectati
 isRight' result expected = case result of
   Right built -> void built `shouldBe` expected
   Left errors -> expectationFailure (show errors)
+
+o1 :: Oid
+o1 = fst (withId (commit "x\n"))
 
 loaded :: Model
 loaded = applyWorker (HistoryLoaded (map (withId . commit) ["one\n", "two\n"])) (initialModel "refs/heads/main")
@@ -133,6 +137,57 @@ spec = do
       withFixtureRepo history $ \repo ->
         withStore repo (\s -> oldestFirst s >>= previewRewrite s (pure True) False (specPlan shiftAndScrub))
           `shouldThrow` (\PreviewCancelled -> True)
+
+  describe "search" $ do
+    let typing :: String -> Model
+        typing = foldl (\m ch -> searchKey (V.EvKey (V.KChar ch) []) m) loaded {mSearching = True}
+        subjects m = map (cMessage . snd) (foldr (:) [] (listElements (mCommits m)))
+    it "filters as you type" $
+      subjects (typing "tw") `shouldBe` ["two\n"]
+    it "matches hashes case-insensitively" $ do
+      let (oid, c) = withId (commit "one\n")
+      matches (T.toUpper (T.take 6 (displayText (oidToHex oid)))) (oid, c) `shouldBe` True
+    it "keeps the filter on Enter and clears it on Esc" $ do
+      let kept = searchKey (V.EvKey V.KEnter []) (typing "tw")
+      (mSearching kept, mFilter kept) `shouldBe` (False, "tw")
+      subjects (searchKey (V.EvKey V.KEsc []) (typing "tw")) `shouldBe` ["one\n", "two\n"]
+    it "keeps the selected commit selected when it still matches" $ do
+      let second = loaded {mCommits = listMoveDown (mCommits loaded)}
+      fmap (cMessage . snd) (selected (setFilter "t" second)) `shouldBe` Just "two\n"
+
+  describe "apply and undo" $ do
+    it "refuse to apply without a preview" $
+      mMessage (requestApply loaded) `shouldSatisfy` \case
+        Just (Problem _) -> True
+        _ -> False
+    it "ask for confirmation when a preview changes something" $ do
+      let (m, _) = formEdited loaded {mForm = mkForm emptyInput {fiShift = "1d"}}
+          shown = applyWorker (PreviewDone (mGen m) (Right (Preview mempty 2 0 0 0))) m
+      case mOverlay (requestApply shown) of
+        ConfirmOverlay (ApplyRewrite _) -> pure ()
+        _ -> expectationFailure "expected a confirmation"
+    it "read y/Enter as yes and n/Esc as no" $
+      map confirmKey [V.EvKey (V.KChar 'y') [], V.EvKey V.KEnter [], V.EvKey (V.KChar 'n') [], V.EvKey V.KEsc [], V.EvKey (V.KChar 'x') []]
+        `shouldBe` [Just True, Just True, Just False, Just False, Nothing]
+    it "reset the form and preview after applying" $ do
+      let (m, _) = formEdited loaded {mForm = mkForm emptyInput {fiShift = "1d"}}
+          done = applyWorker (Applied (Right "rewrote 2 commits")) m {mBusy = True}
+      mBusy done `shouldBe` False
+      mMessage done `shouldBe` Just (Info "rewrote 2 commits")
+      mPreviewed done `shouldSatisfy` isNothing
+      fmap fst (snd (formEdited done)) `shouldBe` Nothing
+    it "report failures without losing the form" $ do
+      let (m, _) = formEdited loaded {mForm = mkForm emptyInput {fiShift = "1d"}}
+          failed = applyWorker (Applied (Left "dirty tree")) m
+      mMessage failed `shouldBe` Just (Problem "dirty tree")
+      mPreviewed failed `shouldSatisfy` (/= Nothing)
+    it "summarise what happened" $
+      applySummary (Report 3 [(o1, o1), (o1, o1)] [] [o1] [] [] [] (Just 4))
+        `shouldBe` "rewrote 2 commits, dropped 1 empty commit · backup #4 (u to undo)"
+
+  describe "date column" $
+    it "switches between author and committer dates" $
+      map (mDates . ($ loaded)) [id, toggleDates, toggleDates . toggleDates] `shouldBe` [AuthorDates, CommitterDates, AuthorDates]
 
   describe "displayText" $ do
     it "expands tabs and hides control characters" $
